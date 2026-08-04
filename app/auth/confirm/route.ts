@@ -4,6 +4,7 @@ import type { EmailOtpType } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { ensureTenantForUser } from "@/lib/auth/provision";
 import { audit } from "@/lib/audit";
+import { env } from "@/lib/env";
 
 /**
  * GET /auth/confirm — troca o token do e-mail (token_hash) por uma sessão.
@@ -25,7 +26,16 @@ export async function GET(request: NextRequest) {
   const type = url.searchParams.get("type") as EmailOtpType | null;
   const requestId = request.headers.get("x-request-id");
 
-  const redirectTo = (path: string) => NextResponse.redirect(new URL(path, url.origin));
+  // NUNCA use `url.origin` (request.nextUrl.origin) como base aqui: em standalone
+  // (self-host atrás de reverse proxy) o Next.js Node runtime resolve `nextUrl`
+  // pelo endereço de bind do servidor (HOSTNAME/PORT do Dockerfile, ex.
+  // 0.0.0.0:3000), não pelo Host público encaminhado pelo proxy — confirmado ao
+  // vivo (redirect batia em https://0.0.0.0:3000/login?error=link_invalido).
+  // `env.NEXT_PUBLIC_APP_URL` é a fonte confiável (lida em runtime, não
+  // embutida no build — ver Dockerfile/lib/env.ts) e já é o padrão usado em
+  // app/api/v1/integrations/nuvemshop/callback/route.ts para o mesmo problema.
+  const redirectTo = (path: string) =>
+    NextResponse.redirect(new URL(path, env.NEXT_PUBLIC_APP_URL));
 
   if (!tokenHash || !type) {
     return redirectTo("/login?error=link_invalido");
