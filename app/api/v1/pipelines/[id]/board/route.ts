@@ -185,17 +185,27 @@ async function withScores(
 ): Promise<{ leads: Lead[]; error: string | null }> {
   if (leads.length === 0) return { leads, error: null };
 
-  const { data, error } = await supabase
-    .from("crm_lead_scores")
-    .select(
-      "lead_id, ai_probability, ai_probability_reason, ai_probability_band, ai_probability_evidence, ai_probability_at",
-    )
-    .eq("organization_id", organizationId)
-    .in(
-      "lead_id",
-      leads.map((l) => l.id),
-    );
+  // Mesmo motivo do batch em withNextActions: um pipeline com centenas de
+  // leads (ex.: 820 migrados do Tomik) faz esse .in() estourar o limite de
+  // URL do gateway sozinho.
+  const leadIdBatches = chunk(
+    leads.map((l) => l.id),
+    NEXT_ACTIONS_BATCH_SIZE,
+  );
+  const results = await Promise.all(
+    leadIdBatches.map((batch) =>
+      supabase
+        .from("crm_lead_scores")
+        .select(
+          "lead_id, ai_probability, ai_probability_reason, ai_probability_band, ai_probability_evidence, ai_probability_at",
+        )
+        .eq("organization_id", organizationId)
+        .in("lead_id", batch),
+    ),
+  );
+  const error = results.find((r) => r.error)?.error;
   if (error) return { leads, error: error.message };
+  const data = results.flatMap((r) => r.data ?? []);
 
   const porLead = new Map<string, NonNullable<Lead["score"]>>();
   for (const row of (data ?? []) as Array<{
@@ -230,6 +240,21 @@ async function withScores(
   };
 }
 
+/**
+ * Tamanho de lote pro `.in(contact_id, ...)` abaixo. Sem isso, um pipeline com
+ * centenas de contatos gera uma query string de dezenas de KB e o gateway
+ * (Kong/PostgREST) devolve "Bad Request" antes de tocar no banco — foi
+ * exatamente o que aconteceu com os 810 contatos migrados do Tomik. 150 UUIDs
+ * (~5.5KB) fica bem dentro de qualquer limite de URL comum.
+ */
+const NEXT_ACTIONS_BATCH_SIZE = 150;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 async function withNextActions(
   supabase: Awaited<ReturnType<typeof createClient>>,
   organizationId: string,
@@ -241,26 +266,42 @@ async function withNextActions(
   ];
   if (contactIds.length === 0) return { leads, error: null };
 
-  const [{ data: estados, error: estadosErr }, { data: candidatos, error: candErr }] =
-    await Promise.all([
-      supabase
-        .from("lead_state")
-        .select("contact_id, next_action, next_action_seq, updated_at")
-        .eq("organization_id", organizationId)
-        .in("contact_id", contactIds)
-        .not("next_action", "is", null),
-      supabase
-        .from("crm_leads")
-        .select(
-          "id, organization_id, pipeline_id, status, last_activity_at, created_at, contact_id",
-        )
-        .eq("organization_id", organizationId)
-        .eq("status", "open")
-        .in("contact_id", contactIds),
-    ]);
+  const idBatches = chunk(contactIds, NEXT_ACTIONS_BATCH_SIZE);
+
+  const [estadosResults, candidatosResults] = await Promise.all([
+    Promise.all(
+      idBatches.map((batch) =>
+        supabase
+          .from("lead_state")
+          .select("contact_id, next_action, next_action_seq, updated_at")
+          .eq("organization_id", organizationId)
+          .in("contact_id", batch)
+          .not("next_action", "is", null),
+      ),
+    ),
+    Promise.all(
+      idBatches.map((batch) =>
+        supabase
+          .from("crm_leads")
+          .select(
+            "id, organization_id, pipeline_id, status, last_activity_at, created_at, contact_id",
+          )
+          .eq("organization_id", organizationId)
+          .eq("status", "open")
+          .in("contact_id", batch),
+      ),
+    ),
+  ]);
+
+  const estadosErr = estadosResults.find((r) => r.error)?.error;
   if (estadosErr) return { leads, error: estadosErr.message };
+  const candErr = candidatosResults.find((r) => r.error)?.error;
   if (candErr) return { leads, error: candErr.message };
-  if (!estados || estados.length === 0) return { leads, error: null };
+
+  const estados = estadosResults.flatMap((r) => r.data ?? []);
+  const candidatos = candidatosResults.flatMap((r) => r.data ?? []);
+
+  if (estados.length === 0) return { leads, error: null };
 
   const { porLead, ambiguas } = roteiaProximasAcoes(
     estados as EstadoDoContato[],
